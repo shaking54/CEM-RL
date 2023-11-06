@@ -1,0 +1,23 @@
+name: gym
+channels:
+  - defaults
+  - pytorch
+  - nvidia
+dependencies:
+  - python=3.9
+  - pytorch=1.12
+  - torchvision
+  - pytorch-cuda=11.7
+  - pip
+  - pip:
+    - cffi==1.12.3
+    - glfw==1.8.1
+    - fastrand==1.1
+    - gymnasium
+    - gymnasium[mujoco]
+    - spicy
+    - cma
+    - numpy
+    - pandas
+    - moviepy
+    - imageio

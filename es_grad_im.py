@@ -8,8 +8,7 @@ import torch.nn.functional as F
 import cma
 import pandas as pd
 
-import gym
-import gym.spaces
+import gymnasium as gym
 import numpy as np
 from tqdm import tqdm
 
@@ -58,14 +57,15 @@ def evaluate(actor, env, memory=None, n_episodes=1, random=False, noise=None, re
     for _ in range(n_episodes):
 
         score = 0
-        obs = deepcopy(env.reset())
+        obs, info = deepcopy(env.reset())
         done = False
+        truncated = False
 
-        while not done:
+        while not done and not truncated:
 
             # get next action and act
             action = policy(obs)
-            n_obs, reward, done, _ = env.step(action)
+            n_obs, reward, done, truncated, info = env.step(action)
             done_bool = 0 if steps + \
                 1 == env._max_episode_steps else float(done)
             score += reward
@@ -552,7 +552,7 @@ if __name__ == "__main__":
                 critic.save_model(args.output, "critic")
                 actor.set_params(es.mu)
                 actor.save_model(args.output, "actor")
-            df = df.append(res, ignore_index=True)
+            df = pd.concat([df, pd.DataFrame([res])], ignore_index=True)
             step_cpt = 0
             print(res)
 

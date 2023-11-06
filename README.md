@@ -1,6 +1,14 @@
 # CEM-RL
 Pytorch implementation of CEM-RL: https://arxiv.org/pdf/1810.01222.pdf
 
+```
+using gymnasium to run v4 env task
+```
+
+```
+can find conda env in yaml/gym.yaml
+```
+
 To reproduce the results of the paper:
 
 Without importance mixing:

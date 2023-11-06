@@ -1,0 +1,21 @@
+name: v4
+channels:
+  - defaults
+  - pytorch
+  - nvidia
+dependencies:
+  - python=3.9
+  - pytorch=1.12
+  - torchvision
+  - pytorch-cuda=11.7
+  - pip
+  - pip:
+    - cffi==1.12.3
+    - glfw==1.8.1
+    - fastrand==1.1
+    - gym==0.25.2
+    - mujoco==3.0.0
+    - numpy
+    - pandas
+    - moviepy
+    - imageio

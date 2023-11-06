@@ -3,7 +3,7 @@ import operator
 
 from scipy.stats import multivariate_normal
 from scipy.stats import norm
-from scipy.misc import logsumexp
+from scipy.special import logsumexp
 
 
 class BasicSampler():
