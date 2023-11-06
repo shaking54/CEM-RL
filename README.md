@@ -1,12 +1,11 @@
 # CEM-RL
 Pytorch implementation of CEM-RL: https://arxiv.org/pdf/1810.01222.pdf
 
-```
-using gymnasium to run v4 env task
-```
+### Using gymnasium to run v4 env task
 
+### Create env
 ```
-can find conda env in yaml/gym.yaml
+conda env create -n gym -f yaml/gym.yaml
 ```
 
 To reproduce the results of the paper:
