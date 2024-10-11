@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.multiprocessing as mp
 import torch.nn.functional as F
-import cma
+# import cma
 import pandas as pd
 
 import gymnasium as gym
@@ -19,6 +19,12 @@ from random_process import GaussianNoise
 from memory import Memory, Archive
 from samplers import IMSampler
 from util import *
+import wandb 
+
+os.environ["WANDB_API_KEY"] = "bd4f9ed4f0e350a34c7ef0ea98f697dd7cb718fe"
+# os.environ["WANDB_MODE"] = "offline"
+
+wandb.init(project="CEM",name="CEM-TQC ant-v3")
 
 
 Sample = namedtuple('Sample', ('params', 'score',
@@ -40,7 +46,11 @@ def evaluate(actor, env, memory=None, n_episodes=1, random=False, noise=None, re
     if not random:
         def policy(state):
             state = FloatTensor(state.reshape(-1))
-            action = actor(state).cpu().data.numpy().flatten()
+            action = actor(state) 
+            if isinstance(action, tuple):
+                action = action[0].cpu().data.numpy().flatten()
+            else:
+                action = action.cpu().data.numpy().flatten()
 
             if noise is not None:
                 action += noise.sample()
@@ -297,6 +307,257 @@ class CriticTD3(RLNN):
             target_param.data.copy_(
                 self.tau * param.data + (1 - self.tau) * target_param.data)
 
+# -----------------------------------SAC-----------------------------------
+
+class ActorSAC(RLNN):
+    
+        def __init__(self, state_dim, action_dim, max_action, args, min_log_std=-20, max_log_std=2):
+            super(ActorSAC, self).__init__(state_dim, action_dim, max_action)
+            self.fc1 = nn.Linear(state_dim, 256)
+            self.fc2 = nn.Linear(256, 256)
+            self.mu_head = nn.Linear(256, action_dim)
+            self.log_std_head = nn.Linear(256, action_dim)
+            self.max_action = max_action
+
+            self.min_log_std = min_log_std
+            self.max_log_std = max_log_std
+            
+            self.optimizer = torch.optim.Adam(self.parameters(), lr=args.actor_lr)
+            self.tau = args.tau
+            self.args = args
+            
+            
+        def forward(self, state):
+            x = torch.relu(self.fc1(state))
+            x = torch.relu(self.fc2(x))
+            mu = self.mu_head(x)
+            log_std_head = self.log_std_head(x)
+            log_std_head = torch.clamp(log_std_head, self.min_log_std, self.max_log_std)
+            return mu, log_std_head
+    
+        def update(self, memory, batch_size, critic, critic_t):
+    
+            # Sample replay buffer
+            states, _, _, _, _ = memory.sample(batch_size)
+    
+            # Compute actor loss
+            actor_loss = -critic(states, self(states)).mean()
+    
+            # Optimize the actor
+            self.optimizer.zero_grad()
+            actor_loss.backward()
+            self.optimizer.step()
+
+            # Update the frozen target models
+            for param, target_param in zip(self.parameters(), critic_t.parameters()):
+                target_param.data.copy_(
+                    self.tau * param.data + (1 - self.tau) * target_param.data)
+
+class CriticSAC(RLNN):
+    def __init__(self, state_dim, action_dim, max_action, args):
+        super(CriticSAC, self).__init__(state_dim, action_dim, 1)
+
+        self.l1 = nn.Linear(state_dim + action_dim, 256)
+        self.l2 = nn.Linear(256, 256)
+        self.l3 = nn.Linear(256, 1)
+
+        if args.layer_norm:
+            self.n1 = nn.LayerNorm(256)
+            self.n2 = nn.LayerNorm(256)
+
+        self.layer_norm = args.layer_norm
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=args.critic_lr)
+        self.tau = args.tau
+        self.discount = args.discount
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.max_action = max_action
+
+    def forward(self, x, u):
+
+        if not self.layer_norm:
+            x = F.leaky_relu(self.l1(torch.cat([x, u], 1)))
+            x = F.leaky_relu(self.l2(x))
+            x = self.l3(x)
+
+        else:
+            x = F.leaky_relu(self.n1(self.l1(torch.cat([x, u], 1))))
+            x = F.leaky_relu(self.n2(self.l2(x)))
+            x = self.l3(x)
+
+        return x
+
+    def update(self, memory, batch_size, actor, critic_t):
+
+        # Sample replay buffer
+        states, n_states, actions, rewards, dones = memory.sample(batch_size)
+
+        # Q target = reward + discount * Q(next_state, pi(next_state))
+        with torch.no_grad():
+            target_Q = critic_t(n_states, actor(n_states))
+            target_Q = rewards + (1 - dones) * self.discount * target_Q
+
+        # Get current Q estimate
+        current_Q = self(states, actions)
+
+        # Compute critic loss
+        critic_loss = nn.MSELoss()(current_Q, target_Q)
+
+        # Optimize the critic
+        self.optimizer.zero_grad()
+        critic_loss.backward()
+        self.optimizer.step()
+
+        # Update the frozen target models
+        for param, target_param in zip(self.parameters(), critic_t.parameters()):
+            target_param.data.copy_(
+                self.tau * param.data + (1 - self.tau) * target_param.data)
+
+
+
+# -----------------------------------SAC-----------------------------------
+
+
+# -----------------------------------TQC-----------------------------------
+def quantile_huber_loss_f(
+    quantiles: torch.Tensor, samples: torch.Tensor
+) -> torch.Tensor:
+    """
+    Calculates the quantile Huber loss for a given set of quantiles and samples.
+
+    Args:
+        quantiles (torch.Tensor): A tensor of shape (batch_size, num_nets, num_quantiles) representing the quantiles.
+        samples (torch.Tensor): A tensor of shape (batch_size, num_samples) representing the samples.
+
+    Returns:
+        torch.Tensor: The quantile Huber loss.
+
+    """
+    pairwise_delta = (
+        samples[:, None, None, :] - quantiles[:, :, :, None]
+    )  # batch x nets x quantiles x samples
+    abs_pairwise_delta = torch.abs(pairwise_delta)
+    huber_loss = torch.where(
+        abs_pairwise_delta > 1, abs_pairwise_delta - 0.5, pairwise_delta**2 * 0.5
+    )
+
+    n_quantiles = quantiles.shape[2]
+
+    tau = (
+        torch.arange(n_quantiles, device=pairwise_delta.device).float() / n_quantiles
+        + 1 / 2 / n_quantiles
+    )
+    loss = (
+        torch.abs(tau[None, None, :, None] - (pairwise_delta < 0).float()) * huber_loss
+    ).mean()
+    return loss
+
+class MLP(nn.Module):
+    def __init__(self, input_size: int, hidden_sizes: list[int], output_size: int):
+        super().__init__()
+
+        self.fully_connected_layers = []
+        for i, next_size in enumerate(hidden_sizes):
+            fully_connected_layer = nn.Linear(input_size, next_size)
+            self.add_module(f"fully_connected_layer_{i}", fully_connected_layer)
+            self.fully_connected_layers.append(fully_connected_layer)
+            input_size = next_size
+
+        self.output_layer = nn.Linear(input_size, output_size)
+
+    def forward(self, state):
+        for fully_connected_layer in self.fully_connected_layers:
+            state = F.relu(fully_connected_layer(state))
+        output = self.output_layer(state)
+        return output
+
+class CriticTQC(RLNN):
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        max_action: int, 
+        num_quantiles: int,
+        num_critics: int,
+        hidden_size: list[int] = None,
+        args: dict = None,
+    ):
+        super(CriticTQC, self).__init__(state_dim, action_dim, 1)
+
+        if hidden_size is None:
+            hidden_size = [512, 512, 512]
+
+        self.q_networks = []
+        self.num_quantiles = num_quantiles
+        self.num_critics = num_critics
+
+        self.tau = args.tau
+        self.discount = args.discount
+        self.gamma = args.gamma
+        self.alpha = args.alpha
+
+        self.top_quantiles_to_drop = args.top_quantiles_to_drop
+
+        self.quantiles_total = (
+            self.num_quantiles * self.num_critics
+        )
+
+        for i in range(self.num_critics):
+            critic_net = MLP(
+                state_dim + action_dim, hidden_size, self.num_quantiles
+            )
+            self.add_module(f"critic_net_{i}", critic_net)
+            self.q_networks.append(critic_net)
+
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=args.critic_lr)
+        
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        if isinstance(action, tuple):
+            action = action[0]
+        network_input = torch.cat((state, action), dim=1)
+        quantiles = torch.stack(
+            tuple(critic(network_input) for critic in self.q_networks), dim=1
+        )
+        return quantiles
+    
+    def update(self, memory, batch_size, actor, critic_t):
+        states, n_states, actions, rewards, dones = memory.sample(batch_size)
+        
+        with torch.no_grad():
+            next_actions, next_log_pi = actor(n_states)
+
+            # compute and cut quantiles at the next state
+            # batch x nets x quantiles
+            target_q_values = critic_t(n_states, next_actions)
+            sorted_target_q_values, _ = torch.sort(
+                target_q_values.reshape(batch_size, -1)
+            )
+            top_quantile_target_q_values = sorted_target_q_values[
+                :, : self.quantiles_total - self.top_quantiles_to_drop
+            ]
+
+            # compute target
+            q_target = rewards + (1 - dones) * self.gamma * (
+                top_quantile_target_q_values
+            )
+
+        q_values = self.forward(states, actions)
+        critic_loss_total = quantile_huber_loss_f(q_values, q_target)
+
+        self.optimizer.zero_grad()
+        critic_loss_total.backward()
+        self.optimizer.step()
+
+        # Update the frozen target models
+        for param, target_param in zip(self.parameters(), critic_t.parameters()):
+            target_param.data.copy_(
+                self.tau * param.data + (1 - self.tau) * target_param.data)
+
+        return critic_loss_total.item()
+
+# -----------------------------------TQC-----------------------------------
+
+
 
 if __name__ == "__main__":
 
@@ -317,9 +578,14 @@ if __name__ == "__main__":
 
     # TD3 parameters
     parser.add_argument('--use_td3', dest='use_td3', action='store_true')
+    parser.add_argument('--use_sac', dest='use_sac', action='store_true')
+    parser.add_argument('--use_tqc', dest='use_tqc', action='store_true')
     parser.add_argument('--policy_noise', default=0.2, type=float)
     parser.add_argument('--noise_clip', default=0.5, type=float)
     parser.add_argument('--policy_freq', default=2, type=int)
+
+    # TQC parameteres
+    parser.add_argument('--top_quantiles_to_drop', default=2, type=int)
 
     # Gaussian noise parameters
     parser.add_argument('--gauss_sigma', default=0.1, type=float)
@@ -341,6 +607,7 @@ if __name__ == "__main__":
 
     # Sampler parameters
     parser.add_argument('--alpha', type=float, default=1)
+    parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--epsilon', type=float, default=0)
     parser.add_argument('--k', type=int, default=1)
 
@@ -384,17 +651,29 @@ if __name__ == "__main__":
         critic = CriticTD3(state_dim, action_dim, max_action, args)
         critic_t = CriticTD3(state_dim, action_dim, max_action, args)
         critic_t.load_state_dict(critic.state_dict())
-
+    elif args.use_sac:
+        critic = CriticSAC(state_dim, action_dim, max_action, args)
+        critic_t = CriticSAC(state_dim, action_dim, max_action, args)
+        critic_t.load_state_dict(critic.state_dict())
+    elif args.use_tqc:
+        critic = CriticTQC(state_dim=state_dim, action_dim=action_dim, max_action=None, num_quantiles=25, num_critics=5, hidden_size=[256, 256, 256], args=args) # [512, 512, 512]
+        critic_t = CriticTQC(state_dim=state_dim, action_dim=action_dim, max_action=None, num_quantiles=25, num_critics=5, hidden_size=[256, 256, 256], args=args)
+        critic_t.load_state_dict(critic.state_dict())
     else:
         critic = Critic(state_dim, action_dim, max_action, args)
         critic_t = Critic(state_dim, action_dim, max_action, args)
         critic_t.load_state_dict(critic.state_dict())
 
     # actor
-    actor = Actor(state_dim, action_dim, max_action, args)
-    actor_t = Actor(state_dim, action_dim, max_action, args)
-    actor_t.load_state_dict(actor.state_dict())
-    a_noise = GaussianNoise(action_dim, sigma=args.gauss_sigma)
+    if args.use_sac or args.use_tqc:
+        actor = ActorSAC(state_dim, action_dim, max_action, args)
+        actor_t = ActorSAC(state_dim, action_dim, max_action, args)
+        actor_t.load_state_dict(actor.state_dict())
+    else:
+        actor = Actor(state_dim, action_dim, max_action, args)
+        actor_t = Actor(state_dim, action_dim, max_action, args)
+        actor_t.load_state_dict(actor.state_dict())
+        a_noise = GaussianNoise(action_dim, sigma=args.gauss_sigma)
 
     if USE_CUDA:
         critic.cuda()
@@ -447,11 +726,11 @@ if __name__ == "__main__":
                     actor.parameters(), lr=args.actor_lr)
 
                 # critic update
-                for _ in tqdm(range((actor_steps + reused_steps) // args.n_grad)):
+                for _ in tqdm(range(int((actor_steps + reused_steps) / args.n_grad))):
                     critic.update(memory, args.batch_size, actor, critic_t)
 
                 # actor update
-                for _ in tqdm(range(actor_steps + reused_steps)):
+                for _ in tqdm(range(int(actor_steps + reused_steps))):
                     actor.update(memory, args.batch_size,
                                  critic, actor_t)
 
@@ -539,6 +818,8 @@ if __name__ == "__main__":
                    "best_score": np.max(fitness),
                    "mu_score": f_mu,
                    "n_reused": n_r}
+
+            wandb.log(res)
 
             if args.save_all_models:
                 os.makedirs(args.output + "/{}_steps".format(total_steps),

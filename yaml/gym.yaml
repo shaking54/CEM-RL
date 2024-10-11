@@ -17,7 +17,7 @@ dependencies:
     - gymnasium[mujoco]
     - spicy
     - cma
-    - numpy
+    - numpy==1.24.1
     - pandas
     - moviepy
     - imageio
