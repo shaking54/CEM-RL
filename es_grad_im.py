@@ -22,7 +22,7 @@ from util import *
 import wandb 
 
 os.environ["WANDB_API_KEY"] = "bd4f9ed4f0e350a34c7ef0ea98f697dd7cb718fe"
-# os.environ["WANDB_MODE"] = "offline"
+os.environ["WANDB_MODE"] = "offline"
 
 wandb.init(project="CEM",name="CEM-TQC ant-v3")
 
@@ -308,32 +308,82 @@ class CriticTD3(RLNN):
                 self.tau * param.data + (1 - self.tau) * target_param.data)
 
 # -----------------------------------SAC-----------------------------------
+from torch.distributions.transformed_distribution import TransformedDistribution
+from torch.distributions.transforms import TanhTransform
+from torch.distributions import normal as pyd
+
+class StableTanhTransform(TanhTransform):
+    def __init__(self, cache_size=1):
+        super().__init__(cache_size=cache_size)
+
+    @staticmethod
+    def atanh(x):
+        return 0.5 * (x.log1p() - (-x).log1p())
+
+    def __eq__(self, other):
+        return isinstance(other, StableTanhTransform)
+
+    def _inverse(self, y):
+        # We do not clamp to the boundary here as it may degrade the performance of certain algorithms.
+        # one should use `cache_size=1` instead
+        return self.atanh(y)
+
+
+class SquashedNormal(TransformedDistribution):
+    def __init__(self, loc, scale):
+        self.loc = loc
+        self.scale = scale
+        self.base_dist = pyd.Normal(loc, scale)
+
+        transforms = [StableTanhTransform()]
+        super().__init__(self.base_dist, transforms, validate_args=False)
+
+    @property
+    def mean(self):
+        mu = self.loc
+        for tr in self.transforms:
+            mu = tr(mu)
+        return mu
 
 class ActorSAC(RLNN):
     
-        def __init__(self, state_dim, action_dim, max_action, args, min_log_std=-20, max_log_std=2):
+        def __init__(self, state_dim, action_dim, max_action, args, hidden_state, min_log_std=-20, max_log_std=2):
             super(ActorSAC, self).__init__(state_dim, action_dim, max_action)
-            self.fc1 = nn.Linear(state_dim, 256)
-            self.fc2 = nn.Linear(256, 256)
-            self.mu_head = nn.Linear(256, action_dim)
-            self.log_std_head = nn.Linear(256, action_dim)
+            
+            if hidden_state is None:
+                hidden_state = [256, 256]
+
+            self.actor_net = nn.Sequential(
+                nn.Linear(state_dim, hidden_state[0]),
+                nn.ReLU(),
+                nn.Linear(hidden_state[0], hidden_state[1]),
+                nn.ReLU
+            )
+            
+            self.mu_head = nn.Linear(hidden_state[1], action_dim)
+            self.log_std_head = nn.Linear(hidden_state[1], action_dim)
             self.max_action = max_action
 
             self.min_log_std = min_log_std
             self.max_log_std = max_log_std
             
-            self.optimizer = torch.optim.Adam(self.parameters(), lr=args.actor_lr)
             self.tau = args.tau
             self.args = args
             
+            self.optimizer = torch.optim.Adam(self.parameters(), lr=args.actor_lr)
             
         def forward(self, state):
-            x = torch.relu(self.fc1(state))
-            x = torch.relu(self.fc2(x))
+            x = self.actor_net(state)
             mu = self.mu_head(x)
             log_std_head = self.log_std_head(x)
             log_std_head = torch.clamp(log_std_head, self.min_log_std, self.max_log_std)
-            return mu, log_std_head
+
+            std = log_std_head.exp()
+            dist = SquashedNormal(mu, std)
+            sample = dist.rsample()
+            log_pi = dist.log_prob(sample).sum(axis=-1, keepdim=True)   
+
+            return sample, log_pi
     
         def update(self, memory, batch_size, critic, critic_t):
     
@@ -538,7 +588,7 @@ class CriticTQC(RLNN):
 
             # compute target
             q_target = rewards + (1 - dones) * self.gamma * (
-                top_quantile_target_q_values
+                top_quantile_target_q_values - (actor.alpha * next_log_pi).reshape(batch_size, -1)
             )
 
         q_values = self.forward(states, actions)
@@ -554,6 +604,76 @@ class CriticTQC(RLNN):
                 self.tau * param.data + (1 - self.tau) * target_param.data)
 
         return critic_loss_total.item()
+
+class ActorTQC(RLNN):
+    def __init__(self, state_dim, action_dim, max_action, args, hidden_state, min_log_std=-20, max_log_std=2):
+        super(ActorTQC, self).__init__(state_dim, action_dim, max_action)
+        if hidden_state is None:
+                hidden_state = [256, 256]
+
+        self.actor_net = nn.Sequential(
+            nn.Linear(state_dim, hidden_state[0]),
+            nn.ReLU(),
+            nn.Linear(hidden_state[0], hidden_state[1]),
+            nn.ReLU()
+        )
+        
+        self.mu_head = nn.Linear(hidden_state[1], action_dim)
+        self.log_std_head = nn.Linear(hidden_state[1], action_dim)
+        self.max_action = max_action
+
+        self.min_log_std = min_log_std
+        self.max_log_std = max_log_std
+        
+        self.tau = args.tau
+        self.args = args
+        
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=args.actor_lr)
+        
+        self.init_temperature = 0.1
+        self.target_entropy = -action_dim
+        self.log_alpha = torch.tensor(np.log(self.init_temperature))
+        self.log_alpha.requires_grad = True
+        self.log_alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=args.actor_lr)
+
+
+    def forward(self, state):
+        x = self.actor_net(state)
+        mu = self.mu_head(x)
+        log_std_head = self.log_std_head(x)
+        log_std_head = torch.clamp(log_std_head, self.min_log_std, self.max_log_std)
+
+        std = log_std_head.exp()
+        dist = SquashedNormal(mu, std)
+        sample = dist.rsample()
+        log_pi = dist.log_prob(sample).sum(axis=-1, keepdim=True)   
+
+        return sample, log_pi
+
+    @property
+    def alpha(self) -> torch.Tensor:
+        return self.log_alpha.exp()
+            
+    def update(self, memory, batch_size, critic, critic_t):
+        states, _, _, _, _ = memory.sample(batch_size)
+
+        new_action, log_pi = self(states)
+        
+        mean_qf_pi = critic(states, new_action).mean(2).mean(1, keepdim=True)
+        actor_loss = (self.alpha * log_pi - mean_qf_pi).mean()
+
+        self.optimizer.zero_grad()
+        actor_loss.backward()
+        self.optimizer.step()
+
+        alpha_loss = -self.log_alpha * (log_pi + self.target_entropy).detach().mean()
+
+        # update the temperature
+        self.log_alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.log_alpha_optimizer.step()
+
+        return actor_loss.item(), alpha_loss.item()
 
 # -----------------------------------TQC-----------------------------------
 
@@ -656,8 +776,8 @@ if __name__ == "__main__":
         critic_t = CriticSAC(state_dim, action_dim, max_action, args)
         critic_t.load_state_dict(critic.state_dict())
     elif args.use_tqc:
-        critic = CriticTQC(state_dim=state_dim, action_dim=action_dim, max_action=None, num_quantiles=25, num_critics=5, hidden_size=[256, 256, 256], args=args) # [512, 512, 512]
-        critic_t = CriticTQC(state_dim=state_dim, action_dim=action_dim, max_action=None, num_quantiles=25, num_critics=5, hidden_size=[256, 256, 256], args=args)
+        critic = CriticTQC(state_dim=state_dim, action_dim=action_dim, max_action=None, num_quantiles=25, num_critics=5, hidden_size=[512, 512, 512], args=args) # [512, 512, 512] [256, 256, 256]
+        critic_t = CriticTQC(state_dim=state_dim, action_dim=action_dim, max_action=None, num_quantiles=25, num_critics=5, hidden_size=[512, 512, 512], args=args)
         critic_t.load_state_dict(critic.state_dict())
     else:
         critic = Critic(state_dim, action_dim, max_action, args)
@@ -665,10 +785,13 @@ if __name__ == "__main__":
         critic_t.load_state_dict(critic.state_dict())
 
     # actor
-    if args.use_sac or args.use_tqc:
+    if args.use_sac :
         actor = ActorSAC(state_dim, action_dim, max_action, args)
         actor_t = ActorSAC(state_dim, action_dim, max_action, args)
         actor_t.load_state_dict(actor.state_dict())
+    elif args.use_tqc:
+        actor = ActorTQC(state_dim, action_dim, max_action, args, hidden_state=[256, 256])
+        actor_t = ActorTQC(state_dim, action_dim, max_action, args, hidden_state=[256, 256])
     else:
         actor = Actor(state_dim, action_dim, max_action, args)
         actor_t = Actor(state_dim, action_dim, max_action, args)
